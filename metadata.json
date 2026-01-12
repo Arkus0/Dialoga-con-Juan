@@ -1,0 +1,7 @@
+{
+  "name": "Dialoga con Juan: Immersive Sociology Debates",
+  "description": "An interactive concept map for sociology that evolves through AI-driven debates with famous theorists.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
