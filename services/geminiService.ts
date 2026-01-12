@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type, Modality } from "@google/genai";
-import { ConceptNode, ConceptLink, TrainingDrill, TrainingStep } from "../types";
+import { ConceptNode, ConceptLink, TrainingDrill, TrainingStep, DebateTurnResult, PedagogyMode, Message } from "../types";
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
@@ -9,15 +9,24 @@ export const expandConcept = async (concept: string, currentNodes: string[]): Pr
   const model = "gemini-3-flash-preview";
   
   const prompt = `
-    You are an expert sociologist and graph theory architect. 
+    You are an expert academic sociologist and graph theory architect. 
     The user is exploring the concept: "${concept}".
     Current existing nodes in the graph are: ${currentNodes.join(", ")}.
     
     Generate 3 to 5 NEW, distinct sub-concepts, theories, or related sociologists specifically connected to "${concept}".
     Do not repeat existing nodes.
+
+    ACADEMIC REQUIREMENTS:
+    1. For each node, provide a standard academic definition.
+    2. List the specific "Seminal Works" (books/papers/years) where this concept originated.
+    3. Explain the "Academic Controversy" (why scholars debate this).
+    4. Provide the approximate "Year" of origin or peak relevance (Integer, e.g., 1867).
+    
+    RELATIONSHIP TAXONOMY:
+    Links MUST use one of these relations: "CRITIQUES", "EXPANDS_UPON", "INFLUENCED_BY", "OPPOSES", "RELATES_TO".
+    Use "CRITIQUES" or "OPPOSES" to show theoretical conflict (e.g. Marx vs Weber).
     
     Return a JSON object with 'nodes' and 'links'.
-    For each node, assign a 'type' (theory, person, concept) and a likely 'associatedTheorist' (e.g., Marx for Capitalism, Weber for Bureaucracy).
   `;
 
   try {
@@ -38,9 +47,13 @@ export const expandConcept = async (concept: string, currentNodes: string[]): Pr
                   label: { type: Type.STRING },
                   type: { type: Type.STRING, enum: ["theory", "person", "concept"] },
                   description: { type: Type.STRING },
+                  keyDefinition: { type: Type.STRING },
+                  seminalWorks: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  academicControversy: { type: Type.STRING },
+                  year: { type: Type.INTEGER, description: "Year of origin (e.g. 1890)" },
                   associatedTheorist: { type: Type.STRING }
                 },
-                required: ["id", "label", "type", "description", "associatedTheorist"]
+                required: ["id", "label", "type", "description", "keyDefinition", "seminalWorks", "academicControversy", "year", "associatedTheorist"]
               }
             },
             links: {
@@ -50,7 +63,7 @@ export const expandConcept = async (concept: string, currentNodes: string[]): Pr
                 properties: {
                   source: { type: Type.STRING },
                   target: { type: Type.STRING },
-                  relation: { type: Type.STRING }
+                  relation: { type: Type.STRING, enum: ["CRITIQUES", "EXPANDS_UPON", "INFLUENCED_BY", "OPPOSES", "RELATES_TO"] }
                 },
                 required: ["source", "target", "relation"]
               }
@@ -82,21 +95,46 @@ export const analyzeDebateTurn = async (
   history: {role: string, content: string}[], 
   lastUserMessage: string,
   theorist: string,
-  topic: string
-): Promise<{ reply: string, score: number, critique: string }> => {
+  topic: string,
+  mode: PedagogyMode = 'DEBATE'
+): Promise<DebateTurnResult> => {
   
   const model = "gemini-3-pro-preview"; // Use Pro for better reasoning
+  
+  let pedagogyInstructions = "";
+  if (mode === 'SOCRATIC') {
+    pedagogyInstructions = `
+      MODE: SOCRATIC TUTOR (MAIEUTICS).
+      CRITICAL RULE: DO NOT explain the concept directly or give the answer.
+      Instead, ask a probing question that leads the user to realize the answer themselves.
+      If they are wrong, ask a question that highlights their contradiction.
+      Be patient but rigorous.
+    `;
+  } else {
+    pedagogyInstructions = `
+      MODE: ACADEMIC DEBATE.
+      Act as a rigorous academic opponent.
+      If the user makes a claim WITHOUT referring to a specific concept, historical event, or text, penalize the score slightly and ask for evidence.
+      If the user uses a term incorrectly, correct them immediately and explicitly.
+      Your response MUST include at least one direct citation or paraphrase from your own written works to support your argument.
+    `;
+  }
   
   // Construct a chat history context
   const context = `
     You are roleplaying as ${theorist}. The topic is ${topic}.
-    You are debating the user. Your goal is to be intellectually rigorous, citing your own theories and historical context.
+    
+    ${pedagogyInstructions}
     
     Analyze the user's latest argument: "${lastUserMessage}".
     
-    1. Respond directly to the user in character (first person). Be provocative but educational.
-    2. Provide a 'score' (1-10) on the strength/logic of their argument.
-    3. Provide a 'critique' (1 sentence) on what they missed or got right.
+    1. Respond directly to the user in character (first person).
+    2. Provide a 'score' (1-10) based on Conceptual Accuracy, Use of Evidence, and Logic.
+    3. Provide a 'critique' (1 sentence). In Socratic mode, this should be a meta-comment on their thinking process.
+    
+    EVOLUTION MECHANIC:
+    If the user mentions a specific modern example, a related concept, or a counter-theory NOT implicitly covered by the current topic "${topic}", you must suggest a new node for the concept map.
+    If no new distinct concept is brought up, 'suggestedNode' should be null.
   `;
 
   try {
@@ -110,7 +148,18 @@ export const analyzeDebateTurn = async (
           properties: {
             reply: { type: Type.STRING },
             score: { type: Type.INTEGER },
-            critique: { type: Type.STRING }
+            critique: { type: Type.STRING },
+            suggestedNode: {
+              type: Type.OBJECT,
+              properties: {
+                label: { type: Type.STRING },
+                description: { type: Type.STRING },
+                type: { type: Type.STRING, enum: ["theory", "person", "concept"] },
+                associatedTheorist: { type: Type.STRING },
+                relation: { type: Type.STRING, enum: ["CRITIQUES", "EXPANDS_UPON", "INFLUENCED_BY", "OPPOSES", "RELATES_TO"] }
+              },
+              nullable: true
+            }
           },
           required: ["reply", "score", "critique"]
         }
@@ -127,6 +176,35 @@ export const analyzeDebateTurn = async (
       score: 5, 
       critique: "System interference detected." 
     };
+  }
+};
+
+export const generateSessionSummary = async (messages: Message[], topic: string): Promise<string> => {
+  const model = "gemini-3-flash-preview";
+  
+  const conversation = messages.map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
+  
+  const prompt = `
+    Act as a research assistant. Summarize the following debate/tutoring session on the topic "${topic}".
+    
+    Format output as Markdown Study Notes including:
+    1. Core Concepts Discussed
+    2. Key Arguments & Counter-Arguments
+    3. Logical Fallacies Identified (if any)
+    4. Agreed Conclusions
+    
+    Conversation History:
+    ${conversation}
+  `;
+
+  try {
+     const response = await ai.models.generateContent({
+       model,
+       contents: prompt
+     });
+     return response.text || "Could not generate summary.";
+  } catch (e) {
+    return "Error generating summary.";
   }
 };
 
